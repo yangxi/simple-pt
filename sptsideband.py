@@ -98,18 +98,21 @@ if arguments.maps:
         m = re.match(r"""
         /proc/(?P<pid>\d+)/maps:
         (?P<start>[0-9a-f]+)-(?P<end>[0-9a-f]+) \s+
-        (?P<perm>\S+) \s+ 
-        (?P<pgoff>[0-9a-f]+) \s+ 
-        ([0-9a-f]+):([0-9a-f]+) \s+ 
-        (?P<inode>\d+) \s+ 
+        (?P<perm>\S+) \s+
+        (?P<pgoff>[0-9a-f]+) \s+
+        ([0-9a-f]+):([0-9a-f]+) \s+
+        (?P<inode>\d+) \s+
         (?P<fn>.*)""", l, re.X)
 	if int(m.group('pid')) not in cr3s.keys():
 	    continue
         if not m:
             print >>sys.stderr, "no match", l,
             continue
-        if not m.group('fn').startswith("/"):
+        fname = m.group('fn');
+        if (fname == "[vdso]"):
+            fname = "/home/yangxi/pt/simple-pt/vdso.so"
+        if not fname.startswith("/"):
             continue
         if m.group('perm').find('x') < 0:
             continue
-        print "0.0", m.group('pid'), cr3s[int(m.group('pid'))], m.group('start'), m.group('pgoff') + "\t" + m.group('fn')
+        print "0.0", m.group('pid'), cr3s[int(m.group('pid'))], m.group('start'), m.group('pgoff') + "\t" + fname

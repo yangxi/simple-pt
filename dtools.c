@@ -127,8 +127,8 @@ void load_sideband(char *fn, struct pt_image *image, struct pt_config *config)
 			fprintf(stderr, "%s:%d: Parse error\n", fn, lineno);
 			continue;
 		}
-		if (ts == 0 && !seen_cr3(cr3))
-			continue;
+		//		if (ts == 0 && !seen_cr3(cr3))
+		//			continue;
 		while (isspace(line[n]))
 			n++;
 		/* timestamp ignored for now. could later be used to distinguish

@@ -1,4 +1,4 @@
-USER_CFLAGS := -g -Wall
+USER_CFLAGS := -O2 -Wall
 ifeq (${UDIS86},1)
 USER_CFLAGS += -DHAVE_UDIS86 -I ../udis86/include
 UDIS86_LDFLAGS := -L ../udis86/libudis86/.libs
@@ -7,9 +7,9 @@ endif
 LIBIPT_LIB := ../processor-trace/lib
 LIBIPT_INCLUDE := ../processor-trace/libipt/include
 
-USER_OBJS := sptdump.o map.o fastdecode.o sptdecode.o dumpkcore.o \
+USER_OBJS := sptdump.o map.o shimpt.o shimdecode.o fastdecode.o sptdecode.o dumpkcore.o \
 	     elf.o symtab.o dtools.o kernel.o ptfeature.o dwarf.o
-USER_EXE := sptdump fastdecode sptdecode ptfeature # dumpkcore
+USER_EXE := shimpt sptdump fastdecode libshimpt.a sptdecode ptfeature # dumpkcore
 MAN := sptdump.man fastdecode.man sptdecode.man ptfeature.man sptcmd.man \
 	sptarchive.man
 
@@ -27,6 +27,9 @@ all:
 modules_install:
 	${M} modules_install
 
+lib_install:
+	cp ./libshimpt.a /usr/lib/
+
 clean: user-clean kernel-clean
 
 kernel-clean:
@@ -41,6 +44,7 @@ user: ${USER_EXE}
 
 sptdump: sptdump.o
 sptdump.o: sptdump.c simple-pt.h map.h
+shimpt.o: shimpt.c shimpt.h
 map.o: map.c map.h
 
 fastdecode: fastdecode.o map.o
@@ -54,6 +58,9 @@ sptdecode: LDFLAGS += ${UDIS86_LDFLAGS}
 sptdecode: LDLIBS += ${UDIS86_LDLIBS}
 sptdecode: LDLIBS += -lipt -lelf -ldwarf
 sptdecode: sptdecode.o map.o elf.o symtab.o dtools.o kernel.o dwarf.o
+shimpt: LDLIBS += -lpthread -lpfm
+libshimpt.a: shimdecode.o map.o elf.o symtab.o dtools.o kernel.o dwarf.o
+	ar  rcs $@ $^
 
 dumpkcore: LDLIBS += -lelf
 

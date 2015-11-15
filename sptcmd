@@ -11,6 +11,7 @@ When cmd has options please use -- to separate them from the sptcmd options.
 
 sptcmd [options] cmd
 --comm COMM -c COMM  Set comm filter for comm (only trace that command)
+--config    -C config only
 --no-kernel -K disable kernel trace (default on) (only use with --comm ...)
 --no-user   -U disable user trace (default on)
 --msr-trace -t enable msr trace in side band
@@ -64,6 +65,7 @@ for ((j = 0; j < $#; j++)) ; do
 	fi
 	case "${ARGS[$j]}" in
 	--comm) ARGS[$j]=-c ;;
+	--config) ARGS[$j]=-C ;;
 	--no-kernel) ARGS[$j]=-K ;;
 	--no-user) ARGS[$j]=-U ;;
 	--msr-trace) ARGS[$j]=-t ;;
@@ -88,9 +90,10 @@ for ((j = 0; j < $#; j++)) ; do
 	esac
 done
 
-while getopts "c:KtURkfdNo:eC:M:P:F:S:s:y:@" opt ${ARGS[@]} ; do
+while getopts "c:CKtURkfdNo:eC:M:P:F:S:s:y:@" opt ${ARGS[@]} ; do
 	case "$opt" in
-	c) COMM="$OPTARG" ; ENUMDFL=0 ;;
+        c) COMM="$OPTARG" ; ENUMDFL=0 ;;
+	C) CONFIGONLY=1 ; ENUMDFL=0 ;;
 	K) KERNEL=0 ;;
 	t) TRACE=1 ;;
 	U) USERMODE=0 ;;
@@ -132,6 +135,7 @@ done
 shift $((OPTIND - 1))
 
 COMM=${COMM:-}
+CONFIGONLY=${CONFIGONLY:-1}
 KERNEL=${KERNEL:-1}
 TRACE=${TRACE:-0}
 USERMODE=${USERMODE:-1}
@@ -160,17 +164,22 @@ if [ "$EUID" -ne 0 ] ; then
 fi
 
 [ -n "$DRIVER" ] && /sbin/rmmod simple_pt
+C=/sys/module/simple_pt/parameters
 if ! lsmod | grep -q simple_pt ; then
 	if [ -r simple-pt.ko ] ; then
-		/sbin/insmod simple-pt.ko force=$FORCE
+	    /sbin/insmod simple-pt.ko force=$FORCE
 	else
-		/sbin/modprobe simple-pt force=$FORCE
+	    /sbin/modprobe simple-pt force=$FORCE
 	fi
+	chmod 777 -R /sys/module/simple_pt
 fi
-C=/sys/module/simple_pt/parameters
+
 if [ -n "$COMM" ] ; then
 	echo $COMM > $C/comm_filter
 	echo 1 > $C/cr3_filter
+elif [ "$CONFIGONLY" == 1 ]; then
+    echo "MYSELF" > $C/comm_filter
+    echo 1 > $C/cr3_filter
 else
 	echo > $C/comm_filter
 	echo 0 > $C/cr3_filter
@@ -180,10 +189,17 @@ echo $USERMODE > $C/user
 echo $DISRETC > $C/dis_retc
 echo $FORCE > $C/force
 T=/sys/kernel/debug/tracing
-echo $TRACE > $T/events/pttp/msr/enable
-echo 1 > $T/events/pttp/exec_cr3/enable
-echo 1 > $T/events/pttp/mmap_cr3/enable
-echo 1 > $T/events/pttp/process_cr3/enable
+if [ "$CONFIGONLY" == 1 ]; then
+    echo 0 > $T/events/pttp/msr/enable
+    echo 0 > $T/events/pttp/exec_cr3/enable
+    echo 0 > $T/events/pttp/mmap_cr3/enable
+    echo 1 > $T/events/pttp/process_cr3/enable
+else
+    echo $TRACE > $T/events/pttp/msr/enable
+    echo 1 > $T/events/pttp/exec_cr3/enable
+    echo 1 > $T/events/pttp/mmap_cr3/enable
+    echo 1 > $T/events/pttp/process_cr3/enable
+fi
 echo $MTC_FREQ > $C/mtc_freq
 echo $CYC_THRESH > $C/cyc_thresh
 echo $PSB_FREQ > $C/psb_freq
@@ -204,6 +220,10 @@ if [ "$ENUMALL" != 0 ] ; then
 	echo >&2 "Wrote initial process maps to ${PREFIX}.maps"
 else
 	echo -n > ${PREFIX}.maps
+fi
+if [ "$CONFIGONLY" == 1 ]; then
+    echo "Config the system, please start it by write 1 to $C/start"
+    exit
 fi
 echo 1 > $C/start
 "$@"

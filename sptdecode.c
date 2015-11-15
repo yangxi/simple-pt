@@ -40,6 +40,13 @@
 #include <errno.h>
 #include <assert.h>
 #include <stddef.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <err.h>
+#include <poll.h>
 
 #include "map.h"
 #include "elf.h"
@@ -51,6 +58,7 @@
 #ifdef HAVE_UDIS86
 #include <udis86.h>
 #endif
+
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(*(x)))
 #define container_of(ptr, type, member) \
@@ -173,6 +181,7 @@ static void print_time(uint64_t ts, uint64_t *last_ts,uint64_t *first_ts)
 }
 
 bool dump_insn;
+bool dump_sym_table;
 bool dump_dwarf;
 
 static char *insn_class(enum pt_insn_class class)
@@ -225,13 +234,50 @@ static void init_dis(struct dis *d) {}
 
 #define NUM_WIDTH 35
 
+static volatile int dump_file = -1;
+struct inst_log {
+  uint64_t addr;
+  uint64_t ts;
+  unsigned char size;
+  unsigned char class;
+};
+struct inst_log *dump_buffer = NULL;
+int dump_buffer_index = 0;
+#define INST_LOG_SIZE (1024*1024)
+
+static void flush_dump_buffer()
+{
+  fprintf(stderr, "Flush %d insts %lu size to file %d \n", dump_buffer_index, dump_buffer_index * sizeof(struct inst_log),dump_file);
+  int write_size = dump_buffer_index * sizeof(struct inst_log);
+  int nr_write = write(dump_file, (char *)dump_buffer, write_size);
+  if (nr_write == -1){
+    perror("Why can't write");
+    fprintf(stderr, "Can't write to fd %d\n", dump_file);
+  }
+  fprintf(stderr, "Wrote %d bytes\n", nr_write);
+  dump_buffer_index = 0;
+}
+
+static void log_insn(struct pt_insn *insn, uint64_t ts)
+{
+  //full
+  if (dump_buffer_index == INST_LOG_SIZE)
+    flush_dump_buffer();
+  struct inst_log * cur = dump_buffer+dump_buffer_index;
+  cur->addr = insn->ip;
+  cur->ts = ts;
+  cur->size = insn->size;
+  cur->class = insn->iclass;
+  dump_buffer_index++;
+}
+
 static void print_insn(struct pt_insn *insn, uint64_t ts,
 		       struct dis *d,
 		       uint64_t cr3)
 {
 	int i;
 	int n;
-	printf("%llx %llu %5s insn: ", 
+	printf("%llx %llu %5s insn: ",
 		(unsigned long long)insn->ip,
 		(unsigned long long)ts,
 		insn_class(insn->iclass));
@@ -300,8 +346,8 @@ static int remove_loops(struct sinsn *l, int nr)
 				if (l[j].iterations == 0)
 					l[j].iterations++;
 				l[j].iterations++;
-				printf("loop %llx-%llx %d-%d %u insn iter %d\n", 
-						(unsigned long long)l[j].ip, 
+				printf("loop %llx-%llx %d-%d %u insn iter %d\n",
+						(unsigned long long)l[j].ip,
 						(unsigned long long)l[i].ip,
 						j, i,
 						insn, l[j].iterations);
@@ -395,6 +441,61 @@ static void print_output(struct sinsn *insnbuf, int sic,
 	}
 }
 
+static int decode_dump(struct pt_insn_decoder *decoder)
+{
+	uint64_t last_ts = 0;
+	struct local_pstate ps;
+
+	for (;;) {
+		uint64_t pos;
+		int err = pt_insn_sync_forward(decoder);
+		if (err < 0) {
+			pt_insn_get_offset(decoder, &pos);
+			printf("%llx: sync forward: %s\n",
+				(unsigned long long)pos,
+				pt_errstr(pt_errcode(err)));
+			break;
+		}
+
+		memset(&ps, 0, sizeof(struct local_pstate));
+
+
+		uint64_t errip = 0;
+		do {
+		  struct pt_insn insn;
+		  uint64_t ts;
+		  insn.ip = 0;
+		  err = pt_insn_next(decoder, &insn, sizeof(struct pt_insn));
+		  if (err < 0) {
+		    errip = insn.ip;
+		    break;
+		  }
+		  // XXX use lost counts
+		  pt_insn_time(decoder, &ts, NULL, NULL);
+		  //		  pt_insn_get_cr3(decoder, &insn.cr3);
+		  if (dump_insn){
+		    log_insn(&insn,ts);
+		    //					print_insn(&insn, si->ts, &dis, si->cr3);
+		  }
+
+		} while (err == 0);
+		if (err == -pte_eos)
+			break;
+		pt_insn_get_offset(decoder, &pos);
+		printf("%llx:%llx: error %s\n",
+				(unsigned long long)pos,
+				(unsigned long long)errip,
+				pt_errstr(pt_errcode(err)));
+	}
+	if (dump_file != -1){
+	  flush_dump_buffer();
+	  close(dump_file);
+	}
+	return 0;
+}
+
+
+
 static int decode(struct pt_insn_decoder *decoder)
 {
 	struct global_pstate gps = { .first_ts = 0, .last_ts = 0 };
@@ -485,12 +586,13 @@ static int decode(struct pt_insn_decoder *decoder)
 
 			if (detect_loop)
 				sic = remove_loops(insnbuf, sic);
-			print_output(insnbuf, sic, &ps, &gps);
+			if (!dump_insn)
+			  print_output(insnbuf, sic, &ps, &gps);
 		} while (err == 0);
 		if (err == -pte_eos)
 			break;
 		pt_insn_get_offset(decoder, &pos);
-		printf("%llx:%llx: error %s\n",
+		fprintf(stderr, "%llx:%llx: error %s\n",
 				(unsigned long long)pos,
 				(unsigned long long)errip,
 				pt_errstr(pt_errcode(err)));
@@ -543,7 +645,7 @@ int main(int ac, char **av)
 	bool use_tsc_time = false;
 
 	pt_config_init(&config);
-	while ((c = getopt_long(ac, av, "e:p:is:ltd", opts, NULL)) != -1) {
+	while ((c = getopt_long(ac, av, "e:p:i:s:ltdD", opts, NULL)) != -1) {
 		switch (c) {
 		case 'e':
 			if (read_elf(optarg, image, 0, 0) < 0) {
@@ -561,6 +663,17 @@ int main(int ac, char **av)
 			break;
 		case 'i':
 			dump_insn = true;
+			dump_file = creat(optarg, 0666);
+			if (dump_file == -1){
+			  fprintf(stderr,"Can't open dump file %s\n", optarg);
+			  exit(1);
+			}
+			dump_buffer = (struct inst_log *)calloc(INST_LOG_SIZE, sizeof(struct inst_log));
+			if (dump_buffer == NULL){
+			  fprintf(stderr, "Can't alloc %ld for dump_buffer\n", INST_LOG_SIZE * sizeof(struct inst_log));
+			  exit(1);
+			}
+			fprintf(stderr,"open dump file %s at fd %d\n", optarg, dump_file);
 			break;
 		case 's':
 			if (decoder) {
@@ -578,6 +691,10 @@ int main(int ac, char **av)
 		case 'd':
 			dump_dwarf = true;
 			break;
+
+		case 'D':
+			dump_sym_table = true;
+			break;
 		default:
 			usage();
 		}
@@ -590,8 +707,19 @@ int main(int ac, char **av)
 	}
 	if (ac - optind != 0 || !decoder)
 		usage();
+	if (dump_sym_table){
+	  struct symtab *st;
+	  for (st = symtabs; st; st = st->next){
+	    dump_symtab(st);
+	  }
+	  goto out;
+	}
 	print_header();
-	decode(decoder);
+	if (dump_insn)
+	  decode_dump(decoder);
+	else
+	  decode(decoder);
+ out:
 	pt_image_free(image);
 	pt_insn_free_decoder(decoder);
 	return 0;

@@ -102,6 +102,7 @@
 static bool delay_start;
 
 static void restart(void);
+static int start_set(const char *val, const struct kernel_param *kp);
 
 static int resync_set(const char *val, const struct kernel_param *kp)
 {
@@ -115,12 +116,8 @@ static struct kernel_param_ops resync_ops = {
 	.get = param_get_int,
 };
 
-static int start_set(const char *val, const struct kernel_param *kp)
-{
-	int ret = resync_set(val, kp);
-	delay_start = false;
-	return ret;
-}
+
+
 static struct kernel_param_ops start_ops = {
 	.set = start_set,
 	.get = param_get_int,
@@ -270,6 +267,9 @@ static struct kernel_param_ops trace_stop_ops = {
 
 /* End of optional code */
 
+DECLARE_PER_CPU(unsigned long, shim_curr_task);
+DECLARE_PER_CPU(int, shim_curr_syscall);
+
 static DEFINE_PER_CPU(unsigned long, pt_buffer_cpu);
 static DEFINE_PER_CPU(u64 *, topa_cpu);
 static DEFINE_PER_CPU(bool, pt_running);
@@ -299,6 +299,18 @@ MODULE_PARM_DESC(kernel, "Set to 0 to not trace kernel space");
 static int tsc_en = 1;
 module_param_cb(tsc, &resync_ops, &tsc_en, 0644);
 MODULE_PARM_DESC(tsc, "Set to 0 to not trace timing");
+static int pidfilter = -1;
+module_param_cb(pidfilter, &resync_ops, &pidfilter, 0644);
+MODULE_PARM_DESC(pidfilter, "Set to the pid you want to observe");
+static int cpufilter = -1;
+module_param_cb(cpufilter, &resync_ops, &cpufilter, 0644);
+MODULE_PARM_DESC(cpufilter, "Set to the pid you want to observe");
+
+/*[cpu0_syscall_addr, cpu0_task_addr],[cpu1_syscall_addr, cpu1_task_addr],.....*/
+static char *shim_signal[100];
+module_param_array(shim_signal, charp, NULL, 0644);
+MODULE_PARM_DESC(shim_signal, "Address of shim signals");
+
 static char comm_filter[100];
 module_param_string(comm_filter, comm_filter, sizeof(comm_filter), 0644);
 MODULE_PARM_DESC(comm_filter, "Process name to set CR3 filter for");
@@ -572,8 +584,10 @@ static int simple_pt_buffer_init(int cpu)
 
 			/* create circular topa table */
 			n = 0;
+			//			topa[n++] = (u64)__pa(pt_buffer) |
+			//				(pt_buffer_order << TOPA_SIZE_SHIFT) | TOPA_STOP;
 			topa[n++] = (u64)__pa(pt_buffer) |
-				(pt_buffer_order << TOPA_SIZE_SHIFT);
+			  (pt_buffer_order << TOPA_SIZE_SHIFT);
 			for (; n < pt_num_buffers; n++) {
 				void *buf = (void *)__get_free_pages(
 					GFP_KERNEL|__GFP_NOWARN|__GFP_ZERO,
@@ -752,11 +766,64 @@ static bool match_comm(void)
 	return !strcmp(current->comm, comm_filter);
 }
 
+/* static bool match_str(char *tag) */
+/* { */
+/* 	char *s; */
+
+/* 	s = strchr(comm_filter, '\n'); */
+/* 	if (s) */
+/* 		*s = 0; */
+/* 	if (comm_filter[0] == 0) */
+/* 	  return true; */
+/* 	return !strcmp(tag, comm_filter); */
+/* } */
+
+
 static u64 retrieve_cr3(void)
 {
 	u64 cr3;
 	asm volatile("mov %%cr3,%0" : "=r" (cr3));
 	return cr3;
+}
+
+static u64 retrieve_pid_cr3(int pid)
+{
+  	struct task_struct *t;
+	u64 ret = 0;
+	/* XXX, better way? */
+	rwlock_t *my_tasklist_lock = (rwlock_t *)kallsyms_lookup_name("tasklist_lock");
+	if (!my_tasklist_lock) {
+		pr_err("Cannot find tasklist_lock\n");
+		return ret;
+	}
+
+	read_lock(my_tasklist_lock);
+	for_each_process (t) {
+		if ((t->flags & PF_KTHREAD) || !t->mm)
+			continue;
+		/* Cannot get the file name here, leave that to user space */
+		if (t->pid == pid)
+		  ret = __pa(t->mm->pgd);
+	}
+	read_unlock(my_tasklist_lock);
+	return ret;
+}
+
+static int start_set(const char *val, const struct kernel_param *kp)
+{
+  u64 cr3 = 0;
+  int ret = resync_set(val, kp);
+  delay_start = false;
+  if (cr3_filter && pidfilter != -1){
+    cr3 = retrieve_pid_cr3(pidfilter);
+    if (cr3 == 0)
+      return ret;
+    mutex_lock(&restart_mutex);
+    on_each_cpu(set_cr3_filter, &cr3, 1);
+    mutex_unlock(&restart_mutex);
+    trace_process_cr3(pidfilter, cr3, "shimpt");
+  }
+  return ret;
 }
 
 static void probe_sched_process_exec(void *arg,
@@ -925,6 +992,24 @@ static int simple_pt_cpuid(void)
 	return 0;
 }
 
+static void init_shim_signals(void)
+{
+  int cpu;
+  volatile int * shim_syscall_signal = NULL;
+  volatile unsigned long * shim_task_signal = NULL;
+  pr_debug("syscall %p, task %p\n", &shim_curr_syscall, &shim_curr_task);
+  for_each_possible_cpu (cpu) {
+    shim_syscall_signal = per_cpu_ptr(&shim_curr_syscall, cpu);
+    shim_task_signal = per_cpu_ptr(&shim_curr_task, cpu);
+
+    shim_signal[cpu * 2] = (char *)__pa(shim_syscall_signal);
+    shim_signal[cpu * 2 + 1] = (char *)__pa(shim_task_signal);
+
+    pr_debug("CPU %d SHIM_SYSCALL, va %p, pa %lx\n", cpu, shim_syscall_signal, __pa(shim_syscall_signal));
+    pr_debug("CPU %d SHIM_TASK, va %p, pa %lx\n", cpu, shim_task_signal, __pa(shim_task_signal));
+  }
+}
+
 static int simple_pt_init(void)
 {
 	int err;
@@ -984,6 +1069,7 @@ static int simple_pt_init(void)
 		restart();
 
 	pr_info("%s\n", start ? "running" : "loaded");
+	init_shim_signals();
 	return 0;
 
 out_buffers2:

@@ -117,7 +117,7 @@ void dump_symtab(struct symtab *st)
 	for (j = 0; j < st->num; j++) {
 		struct sym *s = &st->syms[j];
 		if (s->val && s->name[0])
-			printf("%lx %s\n", s->val, s->name);
+		  printf("%lx %d %s\n", s->val, s->size,s->name);
 	}
 }
 
