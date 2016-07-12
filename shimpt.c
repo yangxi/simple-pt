@@ -12,11 +12,8 @@
 #include <sys/stat.h>
 #include <poll.h>
 
-//ppid signal
-static char * ppid_base = NULL;
-
-
 //shim cmd
+//#define DEBUG
 
 static int parse_value(char *cmd_str, char *key, int default_value)
 {
@@ -167,24 +164,50 @@ static char *copy_name(char *name)
   return dst;
 }
 
-
-static char *ppid_init()
+int grab_signals(int cpu, unsigned long ** ppid, int ** syscall)
 {
-  char *kadr;
+  char buf[1024];
+  unsigned long signal_phy_addr[32];
   int fd;
+  int i;
 
-  if ((fd=open("/dev/ppid_map", O_RDWR|O_SYNC)) < 0) {
-    err(1,"Can't open /dev/ppid_map");
-    exit(-1);
+  if ((fd = open("/sys/module/simple_pt/parameters/shim_signal", O_RDONLY)) < 0){
+    fprintf(stderr, "Can't open /sys/module/simple_pt/parameters/shim_signal\n");
+    return 1;
   }
+  int nr_read = read (fd, buf, 1024);
+  debug_print("read %d bytes %s from shim_sginal\n", nr_read, buf);
+  signal_phy_addr[0] = atol(buf);
+  char *cur = buf;
+  for (i=1; i<32; i=i+1){
+    while (*(cur++) != ',')
+      ;
+    signal_phy_addr[i] = atol(cur);
+  }
+  close(fd);
 
-  kadr = (char *)mmap((void *)0, SHIM_PAGESIZE, PROT_READ|PROT_WRITE, MAP_SHARED| MAP_LOCKED, fd, 0);
-  if (kadr == MAP_FAILED) {
-    perror("mmap");
-    exit(-1);
+  unsigned long mmap_offset = signal_phy_addr[cpu * 2] & 0xffffffffffff0000;
+  int mmap_size = 0x10000;
+  int syscall_offset = signal_phy_addr[cpu * 2] - mmap_offset;
+  int task_offset = signal_phy_addr[cpu * 2 + 1] - mmap_offset;
+  int mmap_fd;
+
+  if ((mmap_fd = open("/dev/mem", O_RDONLY)) < 0) {
+    fprintf(stderr,"Can't open /dev/mem");
+    return 1;
   }
-  return kadr;
+  char *mmap_addr = mmap(0, mmap_size, PROT_READ, MAP_SHARED, mmap_fd, mmap_offset);
+  if (mmap_addr == MAP_FAILED) {
+    fprintf(stderr,"Can't mmap /dev/mem");
+    return 1;
+  }
+  *ppid = (unsigned long *)(mmap_addr + task_offset);
+  *syscall = (int *)(mmap_addr + syscall_offset);
+  debug_print("mmap /dev/mem on fd:%d, offset 0x%lx, at addr %p, ppid %p, syscall %p\n",
+	   mmap_fd, mmap_offset, mmap_addr, *ppid, *syscall);
+  return 0;
 }
+
 
 static void shim_create_hw_event(char *name, int id, shim *myshim)
 {
@@ -236,14 +259,12 @@ static void shim_create_hwsignals(shim *my, int nr_hw_events, char **hw_event_na
   my->pmc_index[nr_hw_events] = -1;
 }
 
-
-
-static char cur_cmd_str[1024];
 static char dump_str[1024];
 
 shim * profiler;
 int outfd = -1;
 
+//ts(long),event0(int)...eventN(int),syscall(int),pid(long),ts(long)
 static void shimpt_read_counter(unsigned int *buf)
 {
   int a,b;
@@ -261,15 +282,17 @@ static void shimpt_read_counter(unsigned int *buf)
   		       "addq $4, %%rdi\n\t"
   		       "jmp 0b\n\t"
   		       "1:\n\t"
+		       "movl (%5), %%ecx\n\t"
+		       "movntil %%ecx, (%%rsi)\n\t"
   		       "movq (%4), %%rcx\n\t"
-  		       "movq %%rcx, (%%rsi)\n\t"
+  		       "movntiq %%rcx, 4(%%rsi)\n\t"
   		       "rdtscp\n\t"
-  		       "movntil %%eax, 8(%%rsi)\n\t"
-  		       "movntil %%edx, 12(%%rsi)\n\t"
-  		       :"+a"(a),"+d"(b):"S"(buf),"D"(profiler->pmc_index),"r"(profiler->ppid_source):"%ecx","memory");
+  		       "movntil %%eax, 12(%%rsi)\n\t"
+  		       "movntil %%edx, 16(%%rsi)\n\t"
+  		       :"+a"(a),"+d"(b):"S"(buf),"D"(profiler->pmc_index),"r"(profiler->ppid_source),"r"(profiler->syscall_source):"%ecx","memory");
 }
 
-
+//ts(long),event0(int)...eventN(int),syscall(int),pid(long),ts(long)
 void debug_dump_log(char *buf)
 {
   int i;
@@ -279,7 +302,7 @@ void debug_dump_log(char *buf)
     fprintf(stderr,",%u", *((unsigned int *)(buf + i * sizeof(unsigned int))));
   }
   buf += profiler->nr_hw_events * sizeof(unsigned int);
-  fprintf(stderr,",%u,%u,%lx]\n",*(unsigned int*)buf, *(unsigned int*)(buf + sizeof(unsigned int)), *(unsigned long*)(buf + 2*sizeof(unsigned int)));
+  fprintf(stderr,"%d,,%u,%u,%lx]\n",*(int *)buf, *(unsigned int*)(buf + sizeof(int)), *(unsigned int*)(buf + 2*sizeof(unsigned int)), *(unsigned long*)(buf + 3*sizeof(unsigned int)));
 }
 
 int main(int argc, char **argv)
@@ -319,23 +342,26 @@ int main(int argc, char **argv)
   int i;
   //  for (i=0;i<MAX_HW_EVENTS;i++)
   //    debug_print("PMC index%d:%x\n", i, profiler->pmc_index[i]);
-  profiler->ppid_source = (unsigned long *)(ppid_init() + cmd->targetcpu * PPID_MAP_ELESIZE);
-  debug_print("Got ppid signal, pid:%d, signal:%d,%d\n", getpid(), (int)(*(profiler->ppid_source)>>32),(int)(*(profiler->ppid_source) & (0xffffffff)));
+  if (grab_signals(cmd->targetcpu, &(profiler->ppid_source), &(profiler->syscall_source))){
+    fprintf(stderr,"Can't find software signals\n");
+    exit(1);
+  }
+
   memset(buf, 0,cmd->buffersize);
 
   char *cur = buf;
   char *end = buf + cmd->buffersize;
   //ts(long),event0(int)...eventN(int),pid(long),ts(long)
-  int log_size = 3 * sizeof(long) + profiler->nr_hw_events * sizeof(int);
-  debug_print("Log size is %d, star to profile\n", log_size);
+  int log_size = 3 * sizeof(long) + (profiler->nr_hw_events + 1)* sizeof(int);
+  debug_print("Log size is %d, start to profile\n", log_size);
   shimpt_read_counter((unsigned int *)(cmd->avg_stat.begin));
   //  debug_dump_log(cmd->avg_stat.begin);
   if (cmd->intelpt)
     turn_on_pt();
   while (cur + log_size < end){
     shimpt_read_counter((unsigned int *)cur);
-#ifdef DEBUG
-    //    debug_dump_log(cur);
+#ifdef SHIM_DEBUG
+    debug_dump_log(cur);
 #endif
     cur += log_size;
   }
@@ -351,8 +377,9 @@ int main(int argc, char **argv)
   for (i=0 ;i<profiler->nr_hw_events; i++){
     dump_str_cur  += sprintf(dump_str_cur,",%s->int",profiler->hw_events[i].name);
   }
-  dump_str_cur += sprintf(dump_str_cur,",tid->int,pid->int,tse->long\n");
-  int nr_write = write(outfd, dump_str, dump_str_cur - dump_str);
-  nr_write = write(outfd, buf, cur-buf);
+  dump_str_cur += sprintf(dump_str_cur,",syscall->int,tid->int,pid->int,tse->long\n");
+  write(outfd, dump_str, dump_str_cur - dump_str);
+  debug_print("Dump %ld bytes\n", write(outfd, buf, cur-buf));
   close(outfd);
+  return 0;
 }

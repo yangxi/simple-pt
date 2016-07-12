@@ -22,7 +22,7 @@
 
 #define MAX_HW_EVENTS (20)
 #define SHIM_PAGESIZE (4096)
-#define SHIM_BUFFERSIZE (16*1024*1024)
+#define SHIM_BUFFERSIZE (32*1024*1024)
 
 #define DEBUG 1
 
@@ -43,6 +43,7 @@ struct shim_worker_struct{
   struct shim_hardware_event hw_events[MAX_HW_EVENTS];
   int pmc_index[MAX_HW_EVENTS];
   unsigned long *ppid_source;
+  int *syscall_source;
   //  int (*probe_other_events)(uint64_t *buf, shim *myshim);
   int (*probe_tags)(uint64_t *buf, shim * myshim);
 };

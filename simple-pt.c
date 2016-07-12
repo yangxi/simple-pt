@@ -307,8 +307,8 @@ module_param_cb(cpufilter, &resync_ops, &cpufilter, 0644);
 MODULE_PARM_DESC(cpufilter, "Set to the pid you want to observe");
 
 /*[cpu0_syscall_addr, cpu0_task_addr],[cpu1_syscall_addr, cpu1_task_addr],.....*/
-static char *shim_signal[100];
-module_param_array(shim_signal, charp, NULL, 0644);
+static unsigned long shim_signal[100];
+module_param_array(shim_signal, ulong, NULL, 0644);
 MODULE_PARM_DESC(shim_signal, "Address of shim signals");
 
 static char comm_filter[100];
@@ -1002,8 +1002,9 @@ static void init_shim_signals(void)
     shim_syscall_signal = per_cpu_ptr(&shim_curr_syscall, cpu);
     shim_task_signal = per_cpu_ptr(&shim_curr_task, cpu);
 
-    shim_signal[cpu * 2] = (char *)__pa(shim_syscall_signal);
-    shim_signal[cpu * 2 + 1] = (char *)__pa(shim_task_signal);
+    shim_signal[cpu * 2] = (unsigned long)__pa(shim_syscall_signal);
+    shim_signal[cpu * 2 + 1] = (unsigned long)__pa(shim_task_signal);
+
 
     pr_debug("CPU %d SHIM_SYSCALL, va %p, pa %lx\n", cpu, shim_syscall_signal, __pa(shim_syscall_signal));
     pr_debug("CPU %d SHIM_TASK, va %p, pa %lx\n", cpu, shim_task_signal, __pa(shim_task_signal));
